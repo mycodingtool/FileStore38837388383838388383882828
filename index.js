@@ -1,68 +1,112 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
+const mongoose = require('mongoose');
 const axios = require('axios');
-const fs = require('fs').promises;
-const path = require('path');
 
 // Config
 const config = {
   token: process.env.BOT_TOKEN,
+  mongodb: process.env.MONGODB_URI,
+  apiId: process.env.API_ID,
+  apiHash: process.env.API_HASH,
   logChannel: process.env.LOG_CHANNEL,
+  ownerId: parseInt(process.env.OWNER_ID),
   admins: process.env.ADMIN_IDS.split(',').map(id => parseInt(id)),
   botUsername: process.env.BOT_USERNAME
 };
 
-// JSON Database Path
-const DB_PATH = path.join(__dirname, 'database.json');
-let db = {
-  users: {},
-  files: {},
-  settings: {
-    adlink_domain: '',
-    adlink_api: '',
-    start_msg: '👋 *Welcome to File Store Bot!*\n\n📤 Send me any file and I\'ll give you a shareable link.\n\n💡 Share links with others to distribute your files easily!',
-    help_msg: '📚 *How to Use:*\n\n1️⃣ Send any file to the bot\n2️⃣ Get a shareable link\n3️⃣ Share the link with others\n4️⃣ First-time users must verify via link\n5️⃣ After verification, direct file access\n\n👨‍💼 *Admin Commands:*\n/setadlink - Configure AdLinkFly\n/setstart - Custom start message\n/sethelp - Custom help message\n/autodelete - Set auto-delete timer\n/addchannel - Add force sub channel\n/removechannel - Remove channel\n/listchannels - List channels\n/protect - Content protection\n/settings - View settings\n/stats - Statistics',
-    auto_delete: 0,
-    protect_content: false
-  },
-  channels: []
-};
+// Database Schemas
+const UserSchema = new mongoose.Schema({
+  userId: { type: Number, unique: true, required: true, index: true },
+  firstName: String,
+  username: String,
+  isVerified: { type: Boolean, default: false },
+  isBanned: { type: Boolean, default: false },
+  verifiedAt: Date,
+  lastActive: { type: Date, default: Date.now },
+  filesShared: { type: Number, default: 0 },
+  filesAccessed: { type: Number, default: 0 },
+  joinedAt: { type: Date, default: Date.now }
+});
 
-// Load/Save Database
-const loadDB = async () => {
-  try {
-    const data = await fs.readFile(DB_PATH, 'utf8');
-    db = { ...db, ...JSON.parse(data) };
-    console.log('✅ Database loaded');
-  } catch (err) {
-    console.log('📝 Creating new database');
-    await saveDB();
-  }
-};
+const FileSchema = new mongoose.Schema({
+  fileId: { type: String, required: true },
+  fileUniqueId: { type: String, unique: true },
+  fileType: String,
+  fileName: String,
+  fileSize: Number,
+  caption: String,
+  shortCode: { type: String, unique: true, required: true, index: true },
+  uploadedBy: { type: Number, required: true },
+  views: { type: Number, default: 0 },
+  downloads: { type: Number, default: 0 },
+  isActive: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now, index: true }
+});
 
-const saveDB = async () => {
-  await fs.writeFile(DB_PATH, JSON.stringify(db, null, 2));
-};
+const SettingSchema = new mongoose.Schema({
+  key: { type: String, unique: true, required: true },
+  value: mongoose.Schema.Types.Mixed,
+  updatedAt: { type: Date, default: Date.now }
+});
+
+const ChannelSchema = new mongoose.Schema({
+  channelId: { type: String, unique: true, required: true },
+  username: String,
+  title: String,
+  addedAt: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', UserSchema);
+const File = mongoose.model('File', FileSchema);
+const Setting = mongoose.model('Setting', SettingSchema);
+const Channel = mongoose.model('Channel', ChannelSchema);
 
 // Initialize Bot
 const bot = new Telegraf(config.token);
 
 // Helper Functions
-const isAdmin = (userId) => config.admins.includes(userId);
+const isOwner = (userId) => userId === config.ownerId;
+const isAdmin = (userId) => config.admins.includes(userId) || isOwner(userId);
+
+const getSetting = async (key, defaultValue = null) => {
+  try {
+    const setting = await Setting.findOne({ key });
+    return setting ? setting.value : defaultValue;
+  } catch (err) {
+    return defaultValue;
+  }
+};
+
+const setSetting = async (key, value) => {
+  await Setting.findOneAndUpdate(
+    { key },
+    { value, updatedAt: new Date() },
+    { upsert: true, new: true }
+  );
+};
+
 const generateCode = () => Math.random().toString(36).substr(2, 8);
 
-// AdLinkFly Shortener - Universal Logic
+const formatFileSize = (bytes) => {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+};
+
+// AdLinkFly Shortener
 const createShortLink = async (url) => {
   try {
-    const domain = db.settings.adlink_domain;
-    const api = db.settings.adlink_api;
+    const domain = await getSetting('adlink_domain');
+    const api = await getSetting('adlink_api');
     
     if (!domain || !api) {
-      console.log('⚠️ AdLinkFly not configured, returning original URL');
+      console.log('⚠️ AdLinkFly not configured');
       return url;
     }
 
-    // Universal shortening logic for all AdLinkFly domains
     const encodedUrl = encodeURIComponent(url);
     const apiUrl = `${domain}/api?api=${api}&url=${encodedUrl}`;
     
@@ -82,533 +126,673 @@ const createShortLink = async (url) => {
 
 // Check Force Subscription
 const checkSubscription = async (ctx) => {
-  if (db.channels.length === 0) return true;
+  try {
+    const channels = await Channel.find();
+    if (channels.length === 0) return true;
 
-  const notJoined = [];
-  for (const ch of db.channels) {
-    try {
-      const member = await ctx.telegram.getChatMember(ch.channelId, ctx.from.id);
-      if (!['member', 'administrator', 'creator'].includes(member.status)) {
-        notJoined.push(ch);
+    const notJoined = [];
+    for (const ch of channels) {
+      try {
+        const member = await ctx.telegram.getChatMember(ch.channelId, ctx.from.id);
+        if (!['member', 'administrator', 'creator'].includes(member.status)) {
+          notJoined.push(ch);
+        }
+      } catch (err) {
+        console.error('Subscription check error:', err.message);
       }
-    } catch (err) {
-      console.error('Subscription check error:', err.message);
     }
-  }
 
-  if (notJoined.length > 0) {
-    const buttons = notJoined.map(ch => [{
-      text: `Join ${ch.username}`,
-      url: `https://t.me/${ch.username.replace('@', '')}`
-    }]);
-    buttons.push([{ text: '✅ Verify Subscription', callback_data: 'verify_sub' }]);
-    
-    await ctx.reply(
-      '⚠️ *Please join these channels first:*',
-      { 
-        reply_markup: { inline_keyboard: buttons },
-        parse_mode: 'Markdown'
-      }
-    );
-    return false;
+    if (notJoined.length > 0) {
+      const buttons = notJoined.map(ch => [{
+        text: `📢 Join ${ch.username}`,
+        url: `https://t.me/${ch.username.replace('@', '')}`
+      }]);
+      buttons.push([{ text: '✅ I Joined, Verify Now', callback_data: 'verify_sub' }]);
+      
+      await ctx.reply(
+        '⚠️ *Access Restricted*\n\n' +
+        '🔒 Please join our channels to access files:',
+        { 
+          reply_markup: { inline_keyboard: buttons },
+          parse_mode: 'Markdown'
+        }
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('Check subscription error:', err);
+    return true;
   }
-  return true;
 };
 
-// Auto Delete Message
-const autoDelete = (ctx, msgId) => {
-  const seconds = db.settings.auto_delete;
-  if (seconds > 0) {
-    setTimeout(() => {
-      ctx.deleteMessage(msgId).catch(() => {});
-    }, seconds * 1000);
+// Auto Delete
+const autoDelete = async (ctx, msgId) => {
+  try {
+    const seconds = await getSetting('auto_delete', 0);
+    if (seconds > 0) {
+      setTimeout(() => {
+        ctx.deleteMessage(msgId).catch(() => {});
+      }, seconds * 1000);
+    }
+  } catch (err) {
+    console.error('Auto delete error:', err);
+  }
+};
+
+// Update user activity
+const updateUserActivity = async (userId, data = {}) => {
+  try {
+    await User.findOneAndUpdate(
+      { userId },
+      { 
+        ...data,
+        lastActive: new Date()
+      },
+      { upsert: true, new: true }
+    );
+  } catch (err) {
+    console.error('Update user error:', err);
   }
 };
 
 // START Command
 bot.start(async (ctx) => {
-  const args = ctx.message.text.split(' ')[1];
-  
-  if (args) {
-    // File request with code
-    const file = db.files[args];
-    if (!file) {
-      return ctx.reply('❌ File not found or expired.');
-    }
+  try {
+    const args = ctx.message.text.split(' ')[1];
+    
+    // Update user info
+    await updateUserActivity(ctx.from.id, {
+      firstName: ctx.from.first_name,
+      username: ctx.from.username
+    });
 
-    // Check force subscription
-    if (!(await checkSubscription(ctx))) return;
-
-    // Get or create user
-    const userId = ctx.from.id;
-    if (!db.users[userId]) {
-      db.users[userId] = { 
-        verified: false,
-        firstName: ctx.from.first_name,
-        username: ctx.from.username
-      };
-      await saveDB();
-    }
-
-    // Check if user is verified
-    if (!db.users[userId].verified) {
-      // Generate verification link
-      const fileUrl = `https://t.me/${config.botUsername}?start=${args}`;
-      const shortUrl = await createShortLink(fileUrl);
-      
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: '🔗 Click Here to Verify', url: shortUrl }],
-          [{ text: '✅ I Have Verified', callback_data: `verify_${args}` }]
-        ]
-      };
-      
-      return ctx.reply(
-        '🔐 *Verification Required*\n\n' +
-        '👆 Click the button above to verify.\n\n' +
-        '✅ After verification, click "I Have Verified" to get your file.\n\n' +
-        '💡 You only need to verify once!',
-        { 
-          reply_markup: keyboard,
-          parse_mode: 'Markdown'
-        }
-      );
-    }
-
-    // User is verified - send file
-    try {
-      let sentMsg;
-      
-      if (file.fileType === 'document') {
-        sentMsg = await ctx.replyWithDocument(file.fileId, {
-          caption: file.caption,
-          protect_content: db.settings.protect_content
-        });
-      } else if (file.fileType === 'video') {
-        sentMsg = await ctx.replyWithVideo(file.fileId, {
-          caption: file.caption,
-          protect_content: db.settings.protect_content
-        });
-      } else if (file.fileType === 'audio') {
-        sentMsg = await ctx.replyWithAudio(file.fileId, {
-          caption: file.caption,
-          protect_content: db.settings.protect_content
-        });
-      } else if (file.fileType === 'photo') {
-        sentMsg = await ctx.replyWithPhoto(file.fileId, {
-          caption: file.caption,
-          protect_content: db.settings.protect_content
-        });
+    if (args) {
+      // File request
+      const file = await File.findOne({ shortCode: args, isActive: true });
+      if (!file) {
+        return ctx.reply('❌ File not found or has been removed.');
       }
-      
-      autoDelete(ctx, sentMsg.message_id);
-      
-      // Log download
-      await ctx.telegram.sendMessage(
-        config.logChannel,
-        `📥 *File Downloaded*\n\n` +
-        `👤 User: ${ctx.from.first_name} (${userId})\n` +
-        `📄 File: ${file.caption || 'No caption'}\n` +
-        `🔑 Code: \`${args}\`\n` +
-        `⏰ Time: ${new Date().toLocaleString()}`,
-        { parse_mode: 'Markdown' }
-      ).catch(() => {});
-      
-    } catch (err) {
-      console.error('Send file error:', err);
-      ctx.reply('❌ Error sending file. Please contact admin.');
+
+      // Check if user is banned
+      const user = await User.findOne({ userId: ctx.from.id });
+      if (user && user.isBanned) {
+        return ctx.reply('🚫 You are banned from using this bot.');
+      }
+
+      // Check subscription
+      if (!(await checkSubscription(ctx))) return;
+
+      // Check verification
+      if (!user || !user.isVerified) {
+        const fileUrl = `https://t.me/${config.botUsername}?start=${args}`;
+        const shortUrl = await createShortLink(fileUrl);
+        
+        // Update file views
+        file.views += 1;
+        await file.save();
+        
+        const keyboard = {
+          inline_keyboard: [
+            [{ text: '🔗 Click Here to Verify & Access', url: shortUrl }],
+            [{ text: '✅ I Have Verified', callback_data: `verify_${args}` }]
+          ]
+        };
+        
+        return ctx.reply(
+          '🔐 *Verification Required*\n\n' +
+          '👉 Click the button below to verify:\n\n' +
+          '✅ After completing verification, click "I Have Verified"\n\n' +
+          '💡 *Note:* You only need to verify once. After that, you\'ll get direct access to all files!',
+          { 
+            reply_markup: keyboard,
+            parse_mode: 'Markdown'
+          }
+        );
+      }
+
+      // Send file
+      try {
+        const protectContent = await getSetting('protect_content', false);
+        let sentMsg;
+        
+        if (file.fileType === 'document') {
+          sentMsg = await ctx.replyWithDocument(file.fileId, {
+            caption: file.caption,
+            protect_content: protectContent
+          });
+        } else if (file.fileType === 'video') {
+          sentMsg = await ctx.replyWithVideo(file.fileId, {
+            caption: file.caption,
+            protect_content: protectContent
+          });
+        } else if (file.fileType === 'audio') {
+          sentMsg = await ctx.replyWithAudio(file.fileId, {
+            caption: file.caption,
+            protect_content: protectContent
+          });
+        } else if (file.fileType === 'photo') {
+          sentMsg = await ctx.replyWithPhoto(file.fileId, {
+            caption: file.caption,
+            protect_content: protectContent
+          });
+        }
+        
+        // Update stats
+        file.downloads += 1;
+        await file.save();
+        
+        user.filesAccessed += 1;
+        await user.save();
+        
+        autoDelete(ctx, sentMsg.message_id);
+        
+        // Log download
+        await ctx.telegram.sendMessage(
+          config.logChannel,
+          `📥 *File Downloaded*\n\n` +
+          `👤 User: ${ctx.from.first_name} (${ctx.from.id})\n` +
+          `📝 Username: @${ctx.from.username || 'none'}\n` +
+          `📄 File: ${file.fileName || file.caption || 'Unknown'}\n` +
+          `🔑 Code: \`${args}\`\n` +
+          `📊 Views: ${file.views} | Downloads: ${file.downloads}\n` +
+          `⏰ Time: ${new Date().toLocaleString()}`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+        
+      } catch (err) {
+        console.error('Send file error:', err);
+        ctx.reply('❌ Error sending file. Please contact admin.');
+      }
+    } else {
+      // Regular start
+      const startMsg = await getSetting('start_msg', 
+        '👋 *Welcome to File Store Bot!*\n\n' +
+        '📤 Send me any file and I\'ll give you a shareable link.\n\n' +
+        '💡 Share links with others to distribute your files easily!\n\n' +
+        '📚 Type /help for more information.'
+      );
+      await ctx.reply(startMsg, { parse_mode: 'Markdown' });
     }
-  } else {
-    // Regular start message
-    await ctx.reply(db.settings.start_msg, { parse_mode: 'Markdown' });
+  } catch (err) {
+    console.error('Start command error:', err);
+    ctx.reply('❌ An error occurred. Please try again later.');
   }
 });
 
 // HELP Command
-bot.help((ctx) => {
-  ctx.reply(db.settings.help_msg, { parse_mode: 'Markdown' });
+bot.help(async (ctx) => {
+  const helpMsg = await getSetting('help_msg',
+    '📚 *Help Menu*\n\n' +
+    '*For Users:*\n' +
+    '1️⃣ Send any file to the bot\n' +
+    '2️⃣ Get a shareable link\n' +
+    '3️⃣ Share the link with others\n' +
+    '4️⃣ First-time users verify via link\n' +
+    '5️⃣ Direct access after verification\n\n' +
+    '*Supported Files:*\n' +
+    '📄 Documents (PDF, ZIP, etc.)\n' +
+    '🎥 Videos\n' +
+    '🎵 Audio\n' +
+    '🖼 Photos\n\n' +
+    '*Admin Commands:*\n' +
+    '/setadlink - Configure AdLinkFly\n' +
+    '/broadcast - Send message to all users\n' +
+    '/stats - View bot statistics\n' +
+    '/ban - Ban a user\n' +
+    '/unban - Unban a user\n' +
+    '/deletefile - Delete a file\n' +
+    '/settings - View all settings'
+  );
+  ctx.reply(helpMsg, { parse_mode: 'Markdown' });
 });
 
 // Verify Callback
 bot.action(/verify_(.+)/, async (ctx) => {
-  const code = ctx.match[1];
-  const userId = ctx.from.id;
-  
-  // Mark user as verified
-  if (!db.users[userId]) {
-    db.users[userId] = { 
-      verified: true,
-      verifiedAt: new Date(),
-      firstName: ctx.from.first_name,
-      username: ctx.from.username
-    };
-  } else {
-    db.users[userId].verified = true;
-    db.users[userId].verifiedAt = new Date();
+  try {
+    const code = ctx.match[1];
+    const userId = ctx.from.id;
+    
+    await User.findOneAndUpdate(
+      { userId },
+      { 
+        verified: true,
+        verifiedAt: new Date(),
+        firstName: ctx.from.first_name,
+        username: ctx.from.username
+      },
+      { upsert: true, new: true }
+    );
+    
+    await ctx.answerCbQuery('✅ Verification successful!');
+    await ctx.reply(
+      '✅ *Congratulations!*\n\n' +
+      '🎉 You are now verified and can access all files directly.\n\n' +
+      '📥 Click your original link again to download the file.',
+      { parse_mode: 'Markdown' }
+    );
+    
+    // Log verification
+    await ctx.telegram.sendMessage(
+      config.logChannel,
+      `✅ *New User Verified*\n\n` +
+      `👤 User: ${ctx.from.first_name} (${userId})\n` +
+      `📝 Username: @${ctx.from.username || 'none'}\n` +
+      `⏰ Time: ${new Date().toLocaleString()}`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+  } catch (err) {
+    console.error('Verify callback error:', err);
+    ctx.answerCbQuery('❌ Verification failed. Please try again.');
   }
-  await saveDB();
-  
-  await ctx.answerCbQuery('✅ Verification successful!');
-  await ctx.reply(
-    '✅ *Verification Successful!*\n\n' +
-    '🎉 You can now access all files directly.\n\n' +
-    '📥 Click your original link again to get the file.',
-    { parse_mode: 'Markdown' }
-  );
-  
-  // Log verification
-  await ctx.telegram.sendMessage(
-    config.logChannel,
-    `✅ *New User Verified*\n\n` +
-    `👤 User: ${ctx.from.first_name} (${userId})\n` +
-    `📝 Username: @${ctx.from.username || 'none'}\n` +
-    `⏰ Time: ${new Date().toLocaleString()}`,
-    { parse_mode: 'Markdown' }
-  ).catch(() => {});
 });
 
 // Subscription Verify Callback
 bot.action('verify_sub', async (ctx) => {
   if (await checkSubscription(ctx)) {
     await ctx.answerCbQuery('✅ Subscription verified!');
-    await ctx.reply('✅ Subscription verified! You can now use the bot.');
+    await ctx.reply('✅ Great! You can now use the bot. Click your file link again.');
   } else {
     await ctx.answerCbQuery('❌ Please join all channels first!', { show_alert: true });
   }
 });
 
-// File Handler (Document, Video, Audio, Photo)
+// File Handler
 bot.on(['document', 'video', 'audio', 'photo'], async (ctx) => {
-  let fileId, fileType, caption;
-
-  if (ctx.message.document) {
-    fileId = ctx.message.document.file_id;
-    fileType = 'document';
-    caption = ctx.message.document.file_name;
-  } else if (ctx.message.video) {
-    fileId = ctx.message.video.file_id;
-    fileType = 'video';
-    caption = ctx.message.video.file_name || 'Video File';
-  } else if (ctx.message.audio) {
-    fileId = ctx.message.audio.file_id;
-    fileType = 'audio';
-    caption = ctx.message.audio.title || ctx.message.audio.file_name || 'Audio File';
-  } else if (ctx.message.photo) {
-    fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-    fileType = 'photo';
-    caption = 'Photo';
-  }
-
-  if (ctx.message.caption) {
-    caption = ctx.message.caption;
-  }
-
-  // Generate unique code
-  const shortCode = generateCode();
-  db.files[shortCode] = {
-    fileId,
-    fileType,
-    caption,
-    uploadedBy: ctx.from.id,
-    uploadedAt: new Date()
-  };
-  await saveDB();
-
-  // Forward to log channel
   try {
-    await ctx.telegram.forwardMessage(
-      config.logChannel,
-      ctx.chat.id,
-      ctx.message.message_id
+    let fileId, fileType, fileName, fileSize, caption;
+
+    if (ctx.message.document) {
+      fileId = ctx.message.document.file_id;
+      fileType = 'document';
+      fileName = ctx.message.document.file_name;
+      fileSize = ctx.message.document.file_size;
+    } else if (ctx.message.video) {
+      fileId = ctx.message.video.file_id;
+      fileType = 'video';
+      fileName = ctx.message.video.file_name || 'Video';
+      fileSize = ctx.message.video.file_size;
+    } else if (ctx.message.audio) {
+      fileId = ctx.message.audio.file_id;
+      fileType = 'audio';
+      fileName = ctx.message.audio.title || ctx.message.audio.file_name || 'Audio';
+      fileSize = ctx.message.audio.file_size;
+    } else if (ctx.message.photo) {
+      const photo = ctx.message.photo[ctx.message.photo.length - 1];
+      fileId = photo.file_id;
+      fileType = 'photo';
+      fileName = 'Photo';
+      fileSize = photo.file_size;
+    }
+
+    caption = ctx.message.caption || fileName;
+
+    // Generate unique code
+    let shortCode;
+    let isUnique = false;
+    while (!isUnique) {
+      shortCode = generateCode();
+      const exists = await File.findOne({ shortCode });
+      if (!exists) isUnique = true;
+    }
+
+    // Save to database
+    const file = new File({
+      fileId,
+      fileType,
+      fileName,
+      fileSize,
+      caption,
+      shortCode,
+      uploadedBy: ctx.from.id
+    });
+    await file.save();
+
+    // Update user stats
+    await User.findOneAndUpdate(
+      { userId: ctx.from.id },
+      { $inc: { filesShared: 1 } },
+      { upsert: true }
     );
-    await ctx.telegram.sendMessage(
-      config.logChannel,
-      `📤 *New File Uploaded*\n\n` +
-      `👤 User: ${ctx.from.first_name} (${ctx.from.id})\n` +
-      `📄 File: ${caption}\n` +
-      `📎 Type: ${fileType}\n` +
-      `🔑 Code: \`${shortCode}\`\n` +
-      `🔗 Link: \`https://t.me/${config.botUsername}?start=${shortCode}\`\n` +
-      `⏰ Time: ${new Date().toLocaleString()}`,
-      { parse_mode: 'Markdown' }
+
+    // Forward to log channel
+    try {
+      await ctx.telegram.forwardMessage(
+        config.logChannel,
+        ctx.chat.id,
+        ctx.message.message_id
+      );
+      await ctx.telegram.sendMessage(
+        config.logChannel,
+        `📤 *New File Uploaded*\n\n` +
+        `👤 User: ${ctx.from.first_name} (${ctx.from.id})\n` +
+        `📝 Username: @${ctx.from.username || 'none'}\n` +
+        `📄 File: ${fileName}\n` +
+        `📦 Size: ${formatFileSize(fileSize)}\n` +
+        `📎 Type: ${fileType}\n` +
+        `🔑 Code: \`${shortCode}\`\n` +
+        `🔗 Link: \`https://t.me/${config.botUsername}?start=${shortCode}\`\n` +
+        `⏰ Time: ${new Date().toLocaleString()}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.error('Log channel error:', err.message);
+    }
+
+    // Send response to user
+    const shareLink = `https://t.me/${config.botUsername}?start=${shortCode}`;
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '🔗 Share Link', url: `https://t.me/share/url?url=${encodeURIComponent(shareLink)}` }]
+      ]
+    };
+    
+    await ctx.reply(
+      `✅ *File Uploaded Successfully!*\n\n` +
+      `📄 *File:* ${fileName}\n` +
+      `📦 *Size:* ${formatFileSize(fileSize)}\n\n` +
+      `📎 *Share Link:*\n\`${shareLink}\`\n\n` +
+      `🔑 *Code:* \`${shortCode}\`\n\n` +
+      `💡 Share this link to let others access your file.`,
+      { 
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+      }
     );
   } catch (err) {
-    console.error('Log channel error:', err.message);
+    console.error('File handler error:', err);
+    ctx.reply('❌ Error uploading file. Please try again.');
   }
-
-  // Send shareable link to user
-  const shareLink = `https://t.me/${config.botUsername}?start=${shortCode}`;
-  await ctx.reply(
-    `✅ *File Uploaded Successfully!*\n\n` +
-    `📎 *Share Link:*\n\`${shareLink}\`\n\n` +
-    `🔑 *Short Code:* \`${shortCode}\`\n\n` +
-    `💡 Share this link with others to let them access your file.`,
-    { parse_mode: 'Markdown' }
-  );
 });
 
 // ADMIN: Set AdLinkFly
 bot.command('setadlink', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ This command is only for admins.');
-  }
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
   
   const args = ctx.message.text.split(' ').slice(1);
   if (args.length < 2) {
     return ctx.reply(
-      '📝 *Set AdLinkFly Configuration*\n\n' +
-      '*Usage:* `/setadlink <domain> <api_key>`\n\n' +
-      '*Example:*\n' +
-      '`/setadlink https://upload.mycodingtools.in 150873c1be29...`',
+      '📝 *Set AdLinkFly*\n\n' +
+      '*Usage:* `/setadlink <domain> <api>`\n\n' +
+      '*Example:*\n`/setadlink https://upload.mycodingtools.in 150873c1be29...`',
       { parse_mode: 'Markdown' }
     );
   }
 
-  db.settings.adlink_domain = args[0];
-  db.settings.adlink_api = args[1];
-  await saveDB();
+  await setSetting('adlink_domain', args[0]);
+  await setSetting('adlink_api', args[1]);
   
   ctx.reply(
-    '✅ *AdLinkFly Configuration Updated!*\n\n' +
+    '✅ *AdLinkFly Updated!*\n\n' +
     `🔗 Domain: \`${args[0]}\`\n` +
     `🔑 API: \`${args[1].substr(0, 10)}...\``,
     { parse_mode: 'Markdown' }
   );
 });
 
-// ADMIN: Set Start Message
-bot.command('setstart', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ This command is only for admins.');
-  }
+// ADMIN: Broadcast
+bot.command('broadcast', async (ctx) => {
+  if (!isOwner(ctx.from.id)) return ctx.reply('❌ Owner only command.');
   
-  const msg = ctx.message.text.replace('/setstart ', '').trim();
-  if (msg === '/setstart' || msg === '') {
+  const msg = ctx.message.text.replace('/broadcast ', '').trim();
+  if (msg === '/broadcast') {
     return ctx.reply(
-      '📝 *Set Start Message*\n\n' +
-      '*Usage:* `/setstart <your message>`\n\n' +
-      '*Example:*\n' +
-      '`/setstart Welcome! Send files to get shareable links 🚀`',
+      '📢 *Broadcast Message*\n\n' +
+      '*Usage:* `/broadcast <message>`\n\n' +
+      'This will send the message to all users.',
       { parse_mode: 'Markdown' }
     );
   }
 
-  db.settings.start_msg = msg;
-  await saveDB();
-  ctx.reply('✅ Start message updated successfully!', { parse_mode: 'Markdown' });
+  const users = await User.find({ isBanned: false });
+  let success = 0, failed = 0;
+  
+  const statusMsg = await ctx.reply(`📤 Broadcasting to ${users.length} users...`);
+  
+  for (const user of users) {
+    try {
+      await ctx.telegram.sendMessage(user.userId, msg, { parse_mode: 'Markdown' });
+      success++;
+      
+      if (success % 10 === 0) {
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          statusMsg.message_id,
+          null,
+          `📤 Broadcasting...\n✅ Sent: ${success}\n❌ Failed: ${failed}`
+        ).catch(() => {});
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 50));
+    } catch (err) {
+      failed++;
+    }
+  }
+  
+  ctx.telegram.editMessageText(
+    ctx.chat.id,
+    statusMsg.message_id,
+    null,
+    `✅ *Broadcast Complete!*\n\n📊 Sent: ${success}\n❌ Failed: ${failed}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ADMIN: Ban User
+bot.command('ban', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
+  
+  const userId = parseInt(ctx.message.text.split(' ')[1]);
+  if (!userId) {
+    return ctx.reply('*Usage:* `/ban <user_id>`', { parse_mode: 'Markdown' });
+  }
+
+  await User.findOneAndUpdate(
+    { userId },
+    { isBanned: true },
+    { upsert: true }
+  );
+  
+  ctx.reply(`✅ User \`${userId}\` has been banned.`, { parse_mode: 'Markdown' });
+});
+
+// ADMIN: Unban User
+bot.command('unban', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
+  
+  const userId = parseInt(ctx.message.text.split(' ')[1]);
+  if (!userId) {
+    return ctx.reply('*Usage:* `/unban <user_id>`', { parse_mode: 'Markdown' });
+  }
+
+  await User.findOneAndUpdate(
+    { userId },
+    { isBanned: false }
+  );
+  
+  ctx.reply(`✅ User \`${userId}\` has been unbanned.`, { parse_mode: 'Markdown' });
+});
+
+// ADMIN: Delete File
+bot.command('deletefile', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
+  
+  const code = ctx.message.text.split(' ')[1];
+  if (!code) {
+    return ctx.reply('*Usage:* `/deletefile <code>`', { parse_mode: 'Markdown' });
+  }
+
+  const file = await File.findOneAndUpdate(
+    { shortCode: code },
+    { isActive: false }
+  );
+  
+  if (file) {
+    ctx.reply(`✅ File \`${code}\` has been deleted.`, { parse_mode: 'Markdown' });
+  } else {
+    ctx.reply(`❌ File \`${code}\` not found.`, { parse_mode: 'Markdown' });
+  }
+});
+
+// ADMIN: Set Start Message
+bot.command('setstart', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
+  
+  const msg = ctx.message.text.replace('/setstart ', '').trim();
+  if (msg === '/setstart') {
+    return ctx.reply('*Usage:* `/setstart <message>`', { parse_mode: 'Markdown' });
+  }
+
+  await setSetting('start_msg', msg);
+  ctx.reply('✅ Start message updated!');
 });
 
 // ADMIN: Set Help Message
 bot.command('sethelp', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ This command is only for admins.');
-  }
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
   
   const msg = ctx.message.text.replace('/sethelp ', '').trim();
-  if (msg === '/sethelp' || msg === '') {
-    return ctx.reply(
-      '📝 *Set Help Message*\n\n' +
-      '*Usage:* `/sethelp <your message>`',
-      { parse_mode: 'Markdown' }
-    );
+  if (msg === '/sethelp') {
+    return ctx.reply('*Usage:* `/sethelp <message>`', { parse_mode: 'Markdown' });
   }
 
-  db.settings.help_msg = msg;
-  await saveDB();
-  ctx.reply('✅ Help message updated successfully!');
+  await setSetting('help_msg', msg);
+  ctx.reply('✅ Help message updated!');
 });
 
 // ADMIN: Auto Delete
 bot.command('autodelete', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ This command is only for admins.');
-  }
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
   
   const seconds = parseInt(ctx.message.text.split(' ')[1]);
   if (isNaN(seconds)) {
     return ctx.reply(
-      '⏱ *Set Auto-Delete Timer*\n\n' +
-      '*Usage:* `/autodelete <seconds>`\n\n' +
-      '*Examples:*\n' +
-      '`/autodelete 300` - Delete after 5 minutes\n' +
-      '`/autodelete 0` - Disable auto-delete',
+      '⏱ *Auto-Delete*\n\n*Usage:* `/autodelete <seconds>`\n\nExample: `/autodelete 300` (5 min)',
       { parse_mode: 'Markdown' }
     );
   }
 
-  db.settings.auto_delete = seconds;
-  await saveDB();
-  
-  if (seconds === 0) {
-    ctx.reply('✅ Auto-delete disabled!');
-  } else {
-    ctx.reply(`✅ Auto-delete set to ${seconds} seconds (${Math.floor(seconds / 60)} minutes)!`);
-  }
+  await setSetting('auto_delete', seconds);
+  ctx.reply(`✅ Auto-delete set to ${seconds}s!`);
 });
 
 // ADMIN: Add Channel
 bot.command('addchannel', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ This command is only for admins.');
-  }
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
   
   const username = ctx.message.text.split(' ')[1];
   if (!username || !username.startsWith('@')) {
-    return ctx.reply(
-      '📺 *Add Force Subscription Channel*\n\n' +
-      '*Usage:* `/addchannel @channelname`\n\n' +
-      '*Example:*\n' +
-      '`/addchannel @mychannel`\n\n' +
-      '⚠️ Make sure bot is admin in the channel!',
-      { parse_mode: 'Markdown' }
-    );
+    return ctx.reply('*Usage:* `/addchannel @channelname`', { parse_mode: 'Markdown' });
   }
 
   try {
     const chat = await ctx.telegram.getChat(username);
-    const exists = db.channels.find(ch => ch.channelId === chat.id.toString());
+    const exists = await Channel.findOne({ channelId: chat.id.toString() });
     
     if (exists) {
-      return ctx.reply('❌ This channel is already added!');
+      return ctx.reply('❌ Channel already added!');
     }
 
-    db.channels.push({
+    await new Channel({
       channelId: chat.id.toString(),
-      username: username,
+      username,
       title: chat.title
-    });
-    await saveDB();
+    }).save();
     
-    ctx.reply(
-      `✅ *Channel Added Successfully!*\n\n` +
-      `📺 Channel: ${username}\n` +
-      `📝 Title: ${chat.title}\n\n` +
-      `Users must now join this channel to access files.`,
-      { parse_mode: 'Markdown' }
-    );
+    ctx.reply(`✅ Channel ${username} added!`, { parse_mode: 'Markdown' });
   } catch (err) {
-    ctx.reply(
-      '❌ *Error adding channel!*\n\n' +
-      'Make sure:\n' +
-      '1️⃣ Bot is admin in the channel\n' +
-      '2️⃣ Channel username is correct\n' +
-      '3️⃣ Channel is public or bot has access',
-      { parse_mode: 'Markdown' }
-    );
+    ctx.reply('❌ Error! Make sure bot is admin in the channel.');
   }
 });
 
 // ADMIN: Remove Channel
 bot.command('removechannel', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ This command is only for admins.');
-  }
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
   
   const username = ctx.message.text.split(' ')[1];
   if (!username) {
-    return ctx.reply(
-      '📺 *Remove Force Subscription Channel*\n\n' +
-      '*Usage:* `/removechannel @channelname`',
-      { parse_mode: 'Markdown' }
-    );
+    return ctx.reply('*Usage:* `/removechannel @channelname`', { parse_mode: 'Markdown' });
   }
 
-  const before = db.channels.length;
-  db.channels = db.channels.filter(ch => ch.username !== username);
-  await saveDB();
-  
-  if (db.channels.length < before) {
-    ctx.reply(`✅ Channel ${username} removed successfully!`);
-  } else {
-    ctx.reply(`❌ Channel ${username} not found in the list.`);
-  }
+  await Channel.deleteOne({ username });
+  ctx.reply(`✅ Channel ${username} removed!`);
 });
 
 // ADMIN: List Channels
 bot.command('listchannels', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ This command is only for admins.');
-  }
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
   
-  if (db.channels.length === 0) {
-    return ctx.reply('📺 No force subscription channels added yet.');
+  const channels = await Channel.find();
+  if (channels.length === 0) {
+    return ctx.reply('📺 No channels added yet.');
   }
 
-  const list = db.channels.map((ch, i) => 
-    `${i + 1}. ${ch.username}\n   📝 ${ch.title}`
-  ).join('\n\n');
+  const list = channels.map((ch, i) => 
+    `${i + 1}. ${ch.username} - ${ch.title}`
+  ).join('\n');
   
-  ctx.reply(
-    `📺 *Force Subscription Channels:*\n\n${list}`,
-    { parse_mode: 'Markdown' }
-  );
+  ctx.reply(`📺 *Force Subscription Channels:*\n\n${list}`, { parse_mode: 'Markdown' });
 });
 
 // ADMIN: Content Protection
 bot.command('protect', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ This command is only for admins.');
-  }
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
   
   const arg = ctx.message.text.split(' ')[1];
   if (arg === 'on') {
-    db.settings.protect_content = true;
-    await saveDB();
-    ctx.reply('🛡 Content protection enabled! Files cannot be forwarded.');
+    await setSetting('protect_content', true);
+    ctx.reply('🛡 Content protection enabled!');
   } else if (arg === 'off') {
-    db.settings.protect_content = false;
-    await saveDB();
+    await setSetting('protect_content', false);
     ctx.reply('🛡 Content protection disabled!');
   } else {
-    ctx.reply(
-      '🛡 *Content Protection*\n\n' +
-      '*Usage:* `/protect <on/off>`\n\n' +
-      '*Examples:*\n' +
-      '`/protect on` - Enable protection\n' +
-      '`/protect off` - Disable protection',
-      { parse_mode: 'Markdown' }
-    );
+    ctx.reply('*Usage:* `/protect <on/off>`', { parse_mode: 'Markdown' });
   }
 });
 
 // ADMIN: Settings
 bot.command('settings', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ This command is only for admins.');
-  }
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
+  
+  const domain = await getSetting('adlink_domain', 'Not set');
+  const api = await getSetting('adlink_api', 'Not set');
+  const autoDelete = await getSetting('auto_delete', 0);
+  const protect = await getSetting('protect_content', false);
+  const channels = await Channel.countDocuments();
   
   const settings = 
-    `⚙️ *Current Bot Settings*\n\n` +
-    `🔗 *AdLinkFly:*\n` +
-    `   Domain: ${db.settings.adlink_domain || 'Not set'}\n` +
-    `   API: ${db.settings.adlink_api ? db.settings.adlink_api.substr(0, 15) + '...' : 'Not set'}\n\n` +
-    `⏱ *Auto Delete:* ${db.settings.auto_delete}s ${db.settings.auto_delete > 0 ? '(' + Math.floor(db.settings.auto_delete / 60) + ' min)' : '(Disabled)'}\n\n` +
-    `🛡 *Content Protection:* ${db.settings.protect_content ? 'Enabled' : 'Disabled'}\n\n` +
-    `📺 *Force Sub Channels:* ${db.channels.length}`;
+    `⚙️ *Bot Settings*\n\n` +
+    `🔗 AdLinkFly Domain: ${domain}\n` +
+    `🔑 API: ${api !== 'Not set' ? api.substr(0, 15) + '...' : 'Not set'}\n` +
+    `⏱ Auto-Delete: ${autoDelete}s\n` +
+    `🛡 Protection: ${protect ? 'ON' : 'OFF'}\n` +
+    `📺 Channels: ${channels}`;
   
   ctx.reply(settings, { parse_mode: 'Markdown' });
 });
 
 // ADMIN: Statistics
 bot.command('stats', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) {
-    return ctx.reply('❌ This command is only for admins.');
-  }
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only command.');
   
-  const totalUsers = Object.keys(db.users).length;
-  const verifiedUsers = Object.values(db.users).filter(u => u.verified).length;
-  const totalFiles = Object.keys(db.files).length;
+  const totalUsers = await User.countDocuments();
+  const verifiedUsers = await User.countDocuments({ isVerified: true });
+  const bannedUsers = await User.countDocuments({ isBanned: true });
+  const totalFiles = await File.countDocuments({ isActive: true });
+  const totalDownloads = await File.aggregate([
+    { $group: { _id: null, total: { $sum: '$downloads' } } }
+  ]);
   
   const stats = 
     `📊 *Bot Statistics*\n\n` +
     `👥 *Users:*\n` +
     `   Total: ${totalUsers}\n` +
     `   Verified: ${verifiedUsers}\n` +
-    `   Unverified: ${totalUsers - verifiedUsers}\n\n` +
-    `📁 *Files:* ${totalFiles}\n\n` +
-    `📺 *Force Sub Channels:* ${db.channels.length}\n\n` +
-    `🛡 *Protection:* ${db.settings.protect_content ? 'ON' : 'OFF'}\n` +
-    `⏱ *Auto-Delete:* ${db.settings.auto_delete}s`;
+    `   Banned: ${bannedUsers}\n\n` +
+    `📁 *Files:*\n` +
+    `   Total: ${totalFiles}\n` +
+    `   Downloads: ${totalDownloads[0]?.total || 0}\n\n` +
+    `📺 *Channels:* ${await Channel.countDocuments()}`;
   
   ctx.reply(stats, { parse_mode: 'Markdown' });
 });
@@ -618,16 +802,38 @@ bot.catch((err, ctx) => {
   console.error('Bot error:', err);
 });
 
-// Start Bot
-loadDB().then(() => {
-  bot.launch();
-  console.log('✅ Bot started successfully!');
-  console.log(`📱 Bot Username: @${config.botUsername}`);
-  
-  // Graceful shutdown
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
-}).catch(err => {
-  console.error('❌ Failed to start bot:', err);
-  process.exit(1);
-});
+// Connect to MongoDB and Start Bot
+mongoose.connect(config.mongodb)
+  .then(() => {
+    console.log('✅ MongoDB Connected');
+    
+    // Initialize default settings
+    (async () => {
+      await setSetting('start_msg', await getSetting('start_msg', 
+        '👋 *Welcome to File Store Bot!*\n\n' +
+        '📤 Send me any file and I\'ll give you a shareable link.\n\n' +
+        '💡 Share links with others to distribute your files easily!'
+      ));
+      
+      await setSetting('help_msg', await getSetting('help_msg',
+        '📚 *Help Menu*\n\n' +
+        '1️⃣ Send file to bot\n' +
+        '2️⃣ Get shareable link\n' +
+        '3️⃣ Share with others\n' +
+        '4️⃣ First-time users verify\n' +
+        '5️⃣ Direct access after'
+      ));
+    })();
+    
+    bot.launch();
+    console.log('✅ Bot Started Successfully!');
+    console.log(`📱 Bot: @${config.botUsername}`);
+    
+    // Graceful shutdown
+    process.once('SIGINT', () => bot.stop('SIGINT'));
+    process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  })
+  .catch(err => {
+    console.error('❌ MongoDB Connection Failed:', err);
+    process.exit(1);
+  });
