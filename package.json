@@ -1,1 +1,27 @@
-
+{
+  "name": "telegram-filestore-bot",
+  "version": "2.0.0",
+  "description": "Advanced Telegram file store bot with MongoDB and AdLinkFly",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "file-store",
+    "adlinkfly",
+    "mongodb"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": "18.x"
+  },
+  "dependencies": {
+    "telegraf": "^4.15.0",
+    "mongoose": "^8.0.3",
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1"
+  }
+}
